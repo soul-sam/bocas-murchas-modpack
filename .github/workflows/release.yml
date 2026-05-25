@@ -98,11 +98,14 @@ jobs:
           for f in mods/*.jar mods-client/*.jar; do
             cp "$f" dist/launcher-pack/mods/
           done
-          # config/ (if present) and manifest go alongside
+          # config/ + shaderpacks/ (if present) and manifest go alongside
           if [[ -d config ]]; then
             cp -r config dist/launcher-pack/
-            # strip the .gitkeep placeholder so it doesn't ship
             find dist/launcher-pack/config -name '.gitkeep' -delete
+          fi
+          if [[ -d shaderpacks ]]; then
+            cp -r shaderpacks dist/launcher-pack/
+            find dist/launcher-pack/shaderpacks -name '.gitkeep' -delete
           fi
           cp manifest.json dist/launcher-pack/
           echo "Launcher pack contents:"
