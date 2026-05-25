@@ -36,14 +36,20 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Tag: $TAG / Version: $VERSION"
 
-      - name: Safety check — refuse empty mods folder
+      - name: Safety check — refuse empty client and server payloads
         run: |
-          MODS_COUNT=$(find mods -name '*.jar' -type f 2>/dev/null | wc -l)
-          if [[ "$MODS_COUNT" -eq 0 ]]; then
-            echo "::error::mods/ não contém nenhum .jar — abortando antes de deletar mods do servidor"
+          CLIENT_COUNT=$(find mods mods-client -maxdepth 2 -name '*.jar' -type f 2>/dev/null | wc -l)
+          SERVER_COUNT=$(find mods mods-server -maxdepth 2 -name '*.jar' -type f 2>/dev/null | wc -l)
+          echo "Client payload (mods/ + mods-client/): $CLIENT_COUNT jars"
+          echo "Server payload (mods/ + mods-server/): $SERVER_COUNT jars"
+          if [[ "$CLIENT_COUNT" -eq 0 ]]; then
+            echo "::error::nenhum jar pro launcher (mods/ + mods-client/ estão vazios)"
             exit 1
           fi
-          echo "Encontrados $MODS_COUNT mod jars pra deployar"
+          if [[ "$SERVER_COUNT" -eq 0 ]]; then
+            echo "::error::nenhum jar pro server (mods/ + mods-server/ estão vazios) — abortando antes de deletar mods do servidor"
+            exit 1
+          fi
 
       - name: Install tools
         run: sudo apt-get update && sudo apt-get install -y lftp jq zip
@@ -54,10 +60,41 @@ jobs:
           mv manifest.tmp.json manifest.json
           cat manifest.json
 
+      - name: Stage client (launcher) payload
+        run: |
+          # client gets: mods/ ∪ mods-client/ flattened into mods/
+          mkdir -p dist/launcher-pack/mods
+          shopt -s nullglob
+          for f in mods/*.jar mods-client/*.jar; do
+            cp "$f" dist/launcher-pack/mods/
+          done
+          # config/ (if present) and manifest go alongside
+          if [[ -d config ]]; then
+            cp -r config dist/launcher-pack/
+            # strip the .gitkeep placeholder so it doesn't ship
+            find dist/launcher-pack/config -name '.gitkeep' -delete
+          fi
+          cp manifest.json dist/launcher-pack/
+          echo "Launcher pack contents:"
+          ls -la dist/launcher-pack/mods/ | wc -l
+          ls -la dist/launcher-pack/
+
+      - name: Stage server payload
+        run: |
+          # server gets: mods/ ∪ mods-server/ flattened into one dir
+          mkdir -p dist/server-mods
+          shopt -s nullglob
+          for f in mods/*.jar mods-server/*.jar; do
+            cp "$f" dist/server-mods/
+          done
+          echo "Server mods staged:"
+          ls -la dist/server-mods/ | wc -l
+
       - name: Build modpack.zip
         run: |
-          mkdir -p dist
-          zip -r dist/modpack.zip mods/ config/ manifest.json -x '*/.gitkeep' '*.DS_Store'
+          cd dist/launcher-pack
+          zip -r ../modpack.zip . -x '*.DS_Store'
+          cd ../..
           ls -la dist/
 
       - name: Create GitHub Release
@@ -80,11 +117,9 @@ jobs:
           AMP_PASS: ${{ secrets.AMP_PASS }}
           AMP_INSECURE: ${{ secrets.AMP_INSECURE }}
         run: |
-          # Strip trailing slash from URL
           URL="${AMP_URL%/}/API/Core/Login"
           echo "POST → $URL"
 
-          # If AMP uses self-signed TLS, set the AMP_INSECURE secret to "true"
           CURL_OPTS=("-sS" "-L" "--connect-timeout" "10" "--max-time" "30")
           if [[ "${AMP_INSECURE,,}" == "true" ]]; then
             CURL_OPTS+=("-k")
@@ -107,27 +142,22 @@ jobs:
 
           if [[ "$CURL_EXIT" -ne 0 ]]; then
             echo "::error::curl falhou com exit code $CURL_EXIT (timeout, DNS, ou TLS — confira AMP_URL e AMP_INSECURE)"
-            echo "--- resposta parcial (até 1KB) ---"
             head -c 1024 /tmp/amp-login.txt || true
             exit 1
           fi
 
           if [[ "$HTTP_CODE" != "200" ]]; then
             echo "::error::AMP login retornou HTTP $HTTP_CODE (esperava 200)"
-            echo "--- resposta (até 1KB) ---"
             head -c 1024 /tmp/amp-login.txt
             exit 1
           fi
 
-          # Validate JSON before parsing
           if ! jq -e . /tmp/amp-login.txt >/dev/null 2>&1; then
-            echo "::error::AMP retornou status 200 mas conteúdo não é JSON. Provável: URL aponta pra página HTML do painel (use a URL do ADS API se for multi-instance) ou redirect pra /Login que renderiza HTML."
-            echo "--- primeiros 500 chars ---"
+            echo "::error::Resposta de login não é JSON. Provável: URL aponta pra HTML do painel."
             head -c 500 /tmp/amp-login.txt
             exit 1
           fi
 
-          # AMP returns success boolean — surface helpful error if false
           SUCCESS=$(jq -r '.success // empty' /tmp/amp-login.txt)
           if [[ "$SUCCESS" == "false" ]]; then
             echo "::error::AMP rejeitou as credenciais (success=false)"
@@ -146,31 +176,116 @@ jobs:
           echo "sid=$SID" >> "$GITHUB_OUTPUT"
           echo "AMP login OK"
 
-      - name: Stop AMP server
+      - name: Discover AMP instances (ADS controller)
+        id: instances
         env:
           AMP_URL: ${{ secrets.AMP_URL }}
           AMP_INSECURE: ${{ secrets.AMP_INSECURE }}
+          AMP_INSTANCE_ID: ${{ secrets.AMP_INSTANCE_ID }}
           SID: ${{ steps.amp.outputs.sid }}
         run: |
-          URL="${AMP_URL%/}/API/Core/Stop"
+          URL="${AMP_URL%/}/API/ADSModule/GetInstances"
           CURL_OPTS=("-sS" "-L" "--connect-timeout" "10" "--max-time" "30")
           if [[ "${AMP_INSECURE,,}" == "true" ]]; then CURL_OPTS+=("-k"); fi
           BODY=$(jq -nc --arg s "$SID" '{SESSIONID:$s}')
-          curl "${CURL_OPTS[@]}" -X POST "$URL" \
+
+          set +e
+          HTTP_CODE=$(curl "${CURL_OPTS[@]}" -o /tmp/amp-instances.json -w "%{http_code}" \
+            -X POST "$URL" \
             -H "Accept: application/json" \
             -H "Content-Type: application/json" \
-            --data "$BODY" || true
+            --data "$BODY")
+          CURL_EXIT=$?
+          set -e
+
+          echo "curl exit=$CURL_EXIT  HTTP=$HTTP_CODE"
+
+          if [[ "$CURL_EXIT" -ne 0 || "$HTTP_CODE" != "200" ]]; then
+            echo "::warning::Não consegui listar instâncias via ADSModule/GetInstances. AMP pode ser standalone (não-ADS)."
+            head -c 1024 /tmp/amp-instances.json || true
+            echo "use_proxy=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! jq -e . /tmp/amp-instances.json >/dev/null 2>&1; then
+            echo "::warning::GetInstances não retornou JSON — assumindo AMP standalone"
+            echo "use_proxy=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Lista resumida pra ajudar o user a achar o InstanceID
+          echo "=== Instâncias visíveis no AMP ==="
+          jq -r '
+            (.result // [])[]?
+            | .AvailableInstances[]?
+            | "  \(.InstanceID)  |  \(.InstanceName)  |  \(.Module)  |  Running=\(.Running)"
+          ' /tmp/amp-instances.json || jq -c . /tmp/amp-instances.json
+          echo "=================================="
+
+          if [[ -z "$AMP_INSTANCE_ID" ]]; then
+            echo "::error::AMP é multi-instância (ADS). Defina o secret AMP_INSTANCE_ID com o GUID da instância MC listada acima."
+            exit 1
+          fi
+
+          # Confirma que o ID existe na lista
+          FOUND=$(jq -r --arg id "$AMP_INSTANCE_ID" '
+            [(.result // [])[]?.AvailableInstances[]? | select(.InstanceID == $id)] | length
+          ' /tmp/amp-instances.json)
+          if [[ "$FOUND" -eq 0 ]]; then
+            echo "::error::AMP_INSTANCE_ID=$AMP_INSTANCE_ID não aparece nas instâncias listadas acima"
+            exit 1
+          fi
+
+          echo "use_proxy=true" >> "$GITHUB_OUTPUT"
+          echo "Rotando Stop/Start via ADS proxy para InstanceID=$AMP_INSTANCE_ID"
+
+      - name: Stop AMP server instance
+        env:
+          AMP_URL: ${{ secrets.AMP_URL }}
+          AMP_INSECURE: ${{ secrets.AMP_INSECURE }}
+          AMP_INSTANCE_ID: ${{ secrets.AMP_INSTANCE_ID }}
+          SID: ${{ steps.amp.outputs.sid }}
+          USE_PROXY: ${{ steps.instances.outputs.use_proxy }}
+        run: |
+          if [[ "$USE_PROXY" == "true" ]]; then
+            URL="${AMP_URL%/}/API/ADSModule/Servers/${AMP_INSTANCE_ID}/API/Core/Stop"
+          else
+            URL="${AMP_URL%/}/API/Core/Stop"
+          fi
+          echo "POST → $URL"
+
+          CURL_OPTS=("-sS" "-L" "--connect-timeout" "10" "--max-time" "30")
+          if [[ "${AMP_INSECURE,,}" == "true" ]]; then CURL_OPTS+=("-k"); fi
+          BODY=$(jq -nc --arg s "$SID" '{SESSIONID:$s}')
+
+          set +e
+          HTTP_CODE=$(curl "${CURL_OPTS[@]}" -o /tmp/amp-stop.txt -w "%{http_code}" \
+            -X POST "$URL" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            --data "$BODY")
+          CURL_EXIT=$?
+          set -e
+
+          echo "curl exit=$CURL_EXIT  HTTP=$HTTP_CODE"
+          echo "--- resposta ---"
+          head -c 1024 /tmp/amp-stop.txt || true
+          echo
+          echo "----------------"
+
+          if [[ "$CURL_EXIT" -ne 0 || "$HTTP_CODE" != "200" ]]; then
+            echo "::error::Stop falhou (exit=$CURL_EXIT HTTP=$HTTP_CODE) — abortando antes do upload pra não pisar em mods que o JVM ainda lê"
+            exit 1
+          fi
+
           echo "Aguardando 25s pro servidor parar limpinho…"
           sleep 25
 
-      - name: Mirror mods + config via SFTP
+      - name: Mirror server mods via SFTP
         env:
           SFTP_HOST: ${{ secrets.SFTP_HOST }}
           SFTP_PORT: ${{ secrets.SFTP_PORT }}
           SFTP_USER: ${{ secrets.SFTP_USER }}
-          # lftp reads the password from $LFTP_PASSWORD via --env-password.
-          # This avoids any shell/lftp-parser interpolation of chars like
-          # #, ;, ?, , or \ that exist in the password.
           LFTP_PASSWORD: ${{ secrets.SFTP_PASS }}
         run: |
           lftp --env-password \
@@ -182,24 +297,47 @@ jobs:
               set net:max-retries 3;
               set net:reconnect-interval-base 5;
               set net:timeout 30;
-              mirror --reverse --delete --verbose --parallel=4 --exclude-glob .gitkeep mods/ /mods/;
+              mirror --reverse --delete --verbose --parallel=4 dist/server-mods/ /mods/;
               mirror --reverse --delete --verbose --parallel=4 --exclude-glob .gitkeep config/ /config/;
               bye
             "
 
-      - name: Start AMP server
+      - name: Start AMP server instance
         if: always() && steps.amp.outputs.sid != ''
         env:
           AMP_URL: ${{ secrets.AMP_URL }}
           AMP_INSECURE: ${{ secrets.AMP_INSECURE }}
+          AMP_INSTANCE_ID: ${{ secrets.AMP_INSTANCE_ID }}
           SID: ${{ steps.amp.outputs.sid }}
+          USE_PROXY: ${{ steps.instances.outputs.use_proxy }}
         run: |
-          URL="${AMP_URL%/}/API/Core/Start"
+          if [[ "$USE_PROXY" == "true" ]]; then
+            URL="${AMP_URL%/}/API/ADSModule/Servers/${AMP_INSTANCE_ID}/API/Core/Start"
+          else
+            URL="${AMP_URL%/}/API/Core/Start"
+          fi
+          echo "POST → $URL"
+
           CURL_OPTS=("-sS" "-L" "--connect-timeout" "10" "--max-time" "30")
           if [[ "${AMP_INSECURE,,}" == "true" ]]; then CURL_OPTS+=("-k"); fi
           BODY=$(jq -nc --arg s "$SID" '{SESSIONID:$s}')
-          curl "${CURL_OPTS[@]}" -X POST "$URL" \
+
+          set +e
+          HTTP_CODE=$(curl "${CURL_OPTS[@]}" -o /tmp/amp-start.txt -w "%{http_code}" \
+            -X POST "$URL" \
             -H "Accept: application/json" \
             -H "Content-Type: application/json" \
-            --data "$BODY"
+            --data "$BODY")
+          CURL_EXIT=$?
+          set -e
+
+          echo "curl exit=$CURL_EXIT  HTTP=$HTTP_CODE"
+          head -c 1024 /tmp/amp-start.txt || true
+          echo
+
+          if [[ "$CURL_EXIT" -ne 0 || "$HTTP_CODE" != "200" ]]; then
+            echo "::error::Start falhou — entre no painel AMP e ligue manualmente"
+            exit 1
+          fi
+
           echo "Servidor iniciado. Pode demorar uns 30-60s pra carregar todo o modpack."
