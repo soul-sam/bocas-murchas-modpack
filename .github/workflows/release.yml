@@ -78,28 +78,85 @@ jobs:
           AMP_URL: ${{ secrets.AMP_URL }}
           AMP_USER: ${{ secrets.AMP_USER }}
           AMP_PASS: ${{ secrets.AMP_PASS }}
+          AMP_INSECURE: ${{ secrets.AMP_INSECURE }}
         run: |
+          # Strip trailing slash from URL
+          URL="${AMP_URL%/}/API/Core/Login"
+          echo "POST → $URL"
+
+          # If AMP uses self-signed TLS, set the AMP_INSECURE secret to "true"
+          CURL_OPTS=("-sS" "-L" "--connect-timeout" "10" "--max-time" "30")
+          if [[ "${AMP_INSECURE,,}" == "true" ]]; then
+            CURL_OPTS+=("-k")
+            echo "AMP_INSECURE=true → pulando verificação TLS"
+          fi
+
           BODY=$(jq -nc --arg u "$AMP_USER" --arg p "$AMP_PASS" \
             '{username:$u, password:$p, token:"", rememberMe:false}')
-          RESP=$(curl -fsSL -X POST "$AMP_URL/API/Core/Login" \
+
+          set +e
+          HTTP_CODE=$(curl "${CURL_OPTS[@]}" -o /tmp/amp-login.txt -w "%{http_code}" \
+            -X POST "$URL" \
             -H "Accept: application/json" \
             -H "Content-Type: application/json" \
             --data "$BODY")
-          SID=$(echo "$RESP" | jq -r '.sessionID // empty')
-          if [[ -z "$SID" ]]; then
-            echo "::error::AMP login falhou. Resposta: $(echo "$RESP" | jq -c '.')"
+          CURL_EXIT=$?
+          set -e
+
+          echo "curl exit=$CURL_EXIT  HTTP status=$HTTP_CODE"
+
+          if [[ "$CURL_EXIT" -ne 0 ]]; then
+            echo "::error::curl falhou com exit code $CURL_EXIT (timeout, DNS, ou TLS — confira AMP_URL e AMP_INSECURE)"
+            echo "--- resposta parcial (até 1KB) ---"
+            head -c 1024 /tmp/amp-login.txt || true
             exit 1
           fi
+
+          if [[ "$HTTP_CODE" != "200" ]]; then
+            echo "::error::AMP login retornou HTTP $HTTP_CODE (esperava 200)"
+            echo "--- resposta (até 1KB) ---"
+            head -c 1024 /tmp/amp-login.txt
+            exit 1
+          fi
+
+          # Validate JSON before parsing
+          if ! jq -e . /tmp/amp-login.txt >/dev/null 2>&1; then
+            echo "::error::AMP retornou status 200 mas conteúdo não é JSON. Provável: URL aponta pra página HTML do painel (use a URL do ADS API se for multi-instance) ou redirect pra /Login que renderiza HTML."
+            echo "--- primeiros 500 chars ---"
+            head -c 500 /tmp/amp-login.txt
+            exit 1
+          fi
+
+          # AMP returns success boolean — surface helpful error if false
+          SUCCESS=$(jq -r '.success // empty' /tmp/amp-login.txt)
+          if [[ "$SUCCESS" == "false" ]]; then
+            echo "::error::AMP rejeitou as credenciais (success=false)"
+            jq -c . /tmp/amp-login.txt
+            exit 1
+          fi
+
+          SID=$(jq -r '.sessionID // empty' /tmp/amp-login.txt)
+          if [[ -z "$SID" ]]; then
+            echo "::error::Login retornou JSON mas sem sessionID"
+            jq -c . /tmp/amp-login.txt
+            exit 1
+          fi
+
           echo "::add-mask::$SID"
           echo "sid=$SID" >> "$GITHUB_OUTPUT"
+          echo "AMP login OK"
 
       - name: Stop AMP server
         env:
           AMP_URL: ${{ secrets.AMP_URL }}
+          AMP_INSECURE: ${{ secrets.AMP_INSECURE }}
           SID: ${{ steps.amp.outputs.sid }}
         run: |
+          URL="${AMP_URL%/}/API/Core/Stop"
+          CURL_OPTS=("-sS" "-L" "--connect-timeout" "10" "--max-time" "30")
+          if [[ "${AMP_INSECURE,,}" == "true" ]]; then CURL_OPTS+=("-k"); fi
           BODY=$(jq -nc --arg s "$SID" '{SESSIONID:$s}')
-          curl -fsSL -X POST "$AMP_URL/API/Core/Stop" \
+          curl "${CURL_OPTS[@]}" -X POST "$URL" \
             -H "Accept: application/json" \
             -H "Content-Type: application/json" \
             --data "$BODY" || true
@@ -134,10 +191,14 @@ jobs:
         if: always() && steps.amp.outputs.sid != ''
         env:
           AMP_URL: ${{ secrets.AMP_URL }}
+          AMP_INSECURE: ${{ secrets.AMP_INSECURE }}
           SID: ${{ steps.amp.outputs.sid }}
         run: |
+          URL="${AMP_URL%/}/API/Core/Start"
+          CURL_OPTS=("-sS" "-L" "--connect-timeout" "10" "--max-time" "30")
+          if [[ "${AMP_INSECURE,,}" == "true" ]]; then CURL_OPTS+=("-k"); fi
           BODY=$(jq -nc --arg s "$SID" '{SESSIONID:$s}')
-          curl -fsSL -X POST "$AMP_URL/API/Core/Start" \
+          curl "${CURL_OPTS[@]}" -X POST "$URL" \
             -H "Accept: application/json" \
             -H "Content-Type: application/json" \
             --data "$BODY"
