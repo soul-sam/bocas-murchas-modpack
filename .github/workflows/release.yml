@@ -168,24 +168,24 @@ jobs:
           SFTP_HOST: ${{ secrets.SFTP_HOST }}
           SFTP_PORT: ${{ secrets.SFTP_PORT }}
           SFTP_USER: ${{ secrets.SFTP_USER }}
-          SFTP_PASS: ${{ secrets.SFTP_PASS }}
+          # lftp reads the password from $LFTP_PASSWORD via --env-password.
+          # This avoids any shell/lftp-parser interpolation of chars like
+          # #, ;, ?, , or \ that exist in the password.
+          LFTP_PASSWORD: ${{ secrets.SFTP_PASS }}
         run: |
-          # lftp lê SFTP_USER/SFTP_PASS apenas via env interpolation aqui dentro,
-          # nunca passa pra command line (não vaza em ps aux).
-          lftp <<'LFTP_SCRIPT'
-          set sftp:auto-confirm yes
-          set net:max-retries 3
-          set net:reconnect-interval-base 5
-          set net:timeout 30
-          LFTP_SCRIPT
-          lftp -e "
-            set sftp:auto-confirm yes;
-            set net:max-retries 3;
-            open -u \"$SFTP_USER\",\"$SFTP_PASS\" -p $SFTP_PORT sftp://$SFTP_HOST;
-            mirror --reverse --delete --verbose --parallel=4 --exclude-glob .gitkeep mods/ /mods/;
-            mirror --reverse --delete --verbose --parallel=4 --exclude-glob .gitkeep config/ /config/;
-            bye
-          "
+          lftp --env-password \
+            -u "$SFTP_USER" \
+            -p "$SFTP_PORT" \
+            "sftp://$SFTP_HOST" \
+            -e "
+              set sftp:auto-confirm yes;
+              set net:max-retries 3;
+              set net:reconnect-interval-base 5;
+              set net:timeout 30;
+              mirror --reverse --delete --verbose --parallel=4 --exclude-glob .gitkeep mods/ /mods/;
+              mirror --reverse --delete --verbose --parallel=4 --exclude-glob .gitkeep config/ /config/;
+              bye
+            "
 
       - name: Start AMP server
         if: always() && steps.amp.outputs.sid != ''
