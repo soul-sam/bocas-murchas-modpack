@@ -213,13 +213,15 @@ jobs:
             exit 0
           fi
 
-          # Lista resumida pra ajudar o user a achar o InstanceID
+          # AMP GetInstances responde de duas formas dependendo da versão:
+          #   - top-level array:   [{"AvailableInstances":[...]}]
+          #   - wrapped object:    {"result":[{"AvailableInstances":[...]}]}
+          # Normaliza pra um stream de instâncias em qualquer um dos dois formatos.
+          NORM='(if type=="array" then . else (.result // []) end) | .[]?.AvailableInstances[]?'
+
           echo "=== Instâncias visíveis no AMP ==="
-          jq -r '
-            (.result // [])[]?
-            | .AvailableInstances[]?
-            | "  \(.InstanceID)  |  \(.InstanceName)  |  \(.Module)  |  Running=\(.Running)"
-          ' /tmp/amp-instances.json || jq -c . /tmp/amp-instances.json
+          jq -r "$NORM | \"  \(.InstanceID)  |  \(.InstanceName)  |  \(.Module)  |  Running=\(.Running)\"" \
+            /tmp/amp-instances.json || jq -c . /tmp/amp-instances.json
           echo "=================================="
 
           if [[ -z "$AMP_INSTANCE_ID" ]]; then
@@ -228,9 +230,8 @@ jobs:
           fi
 
           # Confirma que o ID existe na lista
-          FOUND=$(jq -r --arg id "$AMP_INSTANCE_ID" '
-            [(.result // [])[]?.AvailableInstances[]? | select(.InstanceID == $id)] | length
-          ' /tmp/amp-instances.json)
+          FOUND=$(jq -r --arg id "$AMP_INSTANCE_ID" "[$NORM | select(.InstanceID == \$id)] | length" \
+            /tmp/amp-instances.json)
           if [[ "$FOUND" -eq 0 ]]; then
             echo "::error::AMP_INSTANCE_ID=$AMP_INSTANCE_ID não aparece nas instâncias listadas acima"
             exit 1
