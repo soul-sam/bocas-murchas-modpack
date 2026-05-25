@@ -36,18 +36,48 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Tag: $TAG / Version: $VERSION"
 
-      - name: Safety check — refuse empty client and server payloads
+      - name: Safety check — payloads + no duplicates across folders
         run: |
-          CLIENT_COUNT=$(find mods mods-client -maxdepth 2 -name '*.jar' -type f 2>/dev/null | wc -l)
-          SERVER_COUNT=$(find mods mods-server -maxdepth 2 -name '*.jar' -type f 2>/dev/null | wc -l)
-          echo "Client payload (mods/ + mods-client/): $CLIENT_COUNT jars"
-          echo "Server payload (mods/ + mods-server/): $SERVER_COUNT jars"
-          if [[ "$CLIENT_COUNT" -eq 0 ]]; then
+          shopt -s nullglob
+          COMMON=(mods/*.jar)
+          CLIENT=(mods-client/*.jar)
+          SERVER=(mods-server/*.jar)
+
+          echo "mods/         : ${#COMMON[@]} jars (vão pros dois lados)"
+          echo "mods-client/  : ${#CLIENT[@]} jars (só launcher)"
+          echo "mods-server/  : ${#SERVER[@]} jars (só server)"
+
+          CLIENT_TOTAL=$(( ${#COMMON[@]} + ${#CLIENT[@]} ))
+          SERVER_TOTAL=$(( ${#COMMON[@]} + ${#SERVER[@]} ))
+          echo "Payload final launcher: $CLIENT_TOTAL jars"
+          echo "Payload final server  : $SERVER_TOTAL jars"
+
+          if [[ "$CLIENT_TOTAL" -eq 0 ]]; then
             echo "::error::nenhum jar pro launcher (mods/ + mods-client/ estão vazios)"
             exit 1
           fi
-          if [[ "$SERVER_COUNT" -eq 0 ]]; then
+          if [[ "$SERVER_TOTAL" -eq 0 ]]; then
             echo "::error::nenhum jar pro server (mods/ + mods-server/ estão vazios) — abortando antes de deletar mods do servidor"
+            exit 1
+          fi
+
+          # Cada jar deve ficar em UMA pasta só. Se aparece em duas, a união no
+          # staging anula o split — o jar acaba indo pra todos os lados. Detecta
+          # cedo e força o user a decidir.
+          DUPES=$( {
+            for f in "${COMMON[@]}";  do printf '%s\n' "$(basename "$f")"; done
+            for f in "${CLIENT[@]}";  do printf '%s\n' "$(basename "$f")"; done
+            for f in "${SERVER[@]}";  do printf '%s\n' "$(basename "$f")"; done
+          } | sort | uniq -d )
+
+          if [[ -n "$DUPES" ]]; then
+            echo "::error::Os seguintes jars existem em mais de uma pasta (mods/, mods-client/, mods-server/). Cada mod deve ficar em apenas UMA — a pasta é quem decide o destino."
+            echo "$DUPES" | while read -r name; do
+              echo "  $name:"
+              [[ -f "mods/$name"        ]] && echo "    - mods/$name"
+              [[ -f "mods-client/$name" ]] && echo "    - mods-client/$name"
+              [[ -f "mods-server/$name" ]] && echo "    - mods-server/$name"
+            done
             exit 1
           fi
 
@@ -248,16 +278,21 @@ jobs:
           SID: ${{ steps.amp.outputs.sid }}
           USE_PROXY: ${{ steps.instances.outputs.use_proxy }}
         run: |
+          # Em ADS multi-instance, controlar instância filha pelo controller pede
+          # `ADSModule.StopInstance` (não o proxy /Servers/{id}/Core/Stop, que
+          # exige sessão *da instância filha* e responde "Session.Exists permission").
           if [[ "$USE_PROXY" == "true" ]]; then
-            URL="${AMP_URL%/}/API/ADSModule/Servers/${AMP_INSTANCE_ID}/API/Core/Stop"
+            URL="${AMP_URL%/}/API/ADSModule/StopInstance"
+            BODY=$(jq -nc --arg s "$SID" --arg id "$AMP_INSTANCE_ID" \
+              '{SESSIONID:$s, InstanceName:$id}')
           else
             URL="${AMP_URL%/}/API/Core/Stop"
+            BODY=$(jq -nc --arg s "$SID" '{SESSIONID:$s}')
           fi
           echo "POST → $URL"
 
           CURL_OPTS=("-sS" "-L" "--connect-timeout" "10" "--max-time" "30")
           if [[ "${AMP_INSECURE,,}" == "true" ]]; then CURL_OPTS+=("-k"); fi
-          BODY=$(jq -nc --arg s "$SID" '{SESSIONID:$s}')
 
           set +e
           HTTP_CODE=$(curl "${CURL_OPTS[@]}" -o /tmp/amp-stop.txt -w "%{http_code}" \
@@ -275,7 +310,13 @@ jobs:
           echo "----------------"
 
           if [[ "$CURL_EXIT" -ne 0 || "$HTTP_CODE" != "200" ]]; then
-            echo "::error::Stop falhou (exit=$CURL_EXIT HTTP=$HTTP_CODE) — abortando antes do upload pra não pisar em mods que o JVM ainda lê"
+            echo "::error::Stop falhou (exit=$CURL_EXIT HTTP=$HTTP_CODE) — abortando antes do upload"
+            exit 1
+          fi
+
+          # AMP às vezes responde 200 com {"Title":"Unauthorized Access",...} — checa
+          if jq -e '.Title // empty' /tmp/amp-stop.txt >/dev/null 2>&1; then
+            echo "::error::Stop retornou 200 mas com payload de erro do AMP (ver resposta acima)"
             exit 1
           fi
 
@@ -313,15 +354,17 @@ jobs:
           USE_PROXY: ${{ steps.instances.outputs.use_proxy }}
         run: |
           if [[ "$USE_PROXY" == "true" ]]; then
-            URL="${AMP_URL%/}/API/ADSModule/Servers/${AMP_INSTANCE_ID}/API/Core/Start"
+            URL="${AMP_URL%/}/API/ADSModule/StartInstance"
+            BODY=$(jq -nc --arg s "$SID" --arg id "$AMP_INSTANCE_ID" \
+              '{SESSIONID:$s, InstanceName:$id}')
           else
             URL="${AMP_URL%/}/API/Core/Start"
+            BODY=$(jq -nc --arg s "$SID" '{SESSIONID:$s}')
           fi
           echo "POST → $URL"
 
           CURL_OPTS=("-sS" "-L" "--connect-timeout" "10" "--max-time" "30")
           if [[ "${AMP_INSECURE,,}" == "true" ]]; then CURL_OPTS+=("-k"); fi
-          BODY=$(jq -nc --arg s "$SID" '{SESSIONID:$s}')
 
           set +e
           HTTP_CODE=$(curl "${CURL_OPTS[@]}" -o /tmp/amp-start.txt -w "%{http_code}" \
@@ -338,6 +381,11 @@ jobs:
 
           if [[ "$CURL_EXIT" -ne 0 || "$HTTP_CODE" != "200" ]]; then
             echo "::error::Start falhou — entre no painel AMP e ligue manualmente"
+            exit 1
+          fi
+
+          if jq -e '.Title // empty' /tmp/amp-start.txt >/dev/null 2>&1; then
+            echo "::error::Start retornou 200 mas com payload de erro do AMP (ver resposta acima)"
             exit 1
           fi
 
