@@ -1,0 +1,144 @@
+name: Release modpack + deploy to server
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag override (sem v); usado quando dispara manualmente'
+        required: false
+        default: ''
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute version
+        id: pack
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG=${GITHUB_REF#refs/tags/}
+          elif [[ -n "${{ inputs.tag }}" ]]; then
+            TAG="v${{ inputs.tag }}"
+          else
+            TAG="dev-${GITHUB_SHA::8}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Tag: $TAG / Version: $VERSION"
+
+      - name: Safety check — refuse empty mods folder
+        run: |
+          MODS_COUNT=$(find mods -name '*.jar' -type f 2>/dev/null | wc -l)
+          if [[ "$MODS_COUNT" -eq 0 ]]; then
+            echo "::error::mods/ não contém nenhum .jar — abortando antes de deletar mods do servidor"
+            exit 1
+          fi
+          echo "Encontrados $MODS_COUNT mod jars pra deployar"
+
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y lftp jq zip
+
+      - name: Update manifest version
+        run: |
+          jq --arg v "${{ steps.pack.outputs.version }}" '.version = $v' manifest.json > manifest.tmp.json
+          mv manifest.tmp.json manifest.json
+          cat manifest.json
+
+      - name: Build modpack.zip
+        run: |
+          mkdir -p dist
+          zip -r dist/modpack.zip mods/ config/ manifest.json -x '*/.gitkeep' '*.DS_Store'
+          ls -la dist/
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/modpack.zip
+          tag_name: ${{ steps.pack.outputs.tag }}
+          name: Modpack ${{ steps.pack.outputs.tag }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: AMP login → session
+        id: amp
+        env:
+          AMP_URL: ${{ secrets.AMP_URL }}
+          AMP_USER: ${{ secrets.AMP_USER }}
+          AMP_PASS: ${{ secrets.AMP_PASS }}
+        run: |
+          BODY=$(jq -nc --arg u "$AMP_USER" --arg p "$AMP_PASS" \
+            '{username:$u, password:$p, token:"", rememberMe:false}')
+          RESP=$(curl -fsSL -X POST "$AMP_URL/API/Core/Login" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            --data "$BODY")
+          SID=$(echo "$RESP" | jq -r '.sessionID // empty')
+          if [[ -z "$SID" ]]; then
+            echo "::error::AMP login falhou. Resposta: $(echo "$RESP" | jq -c '.')"
+            exit 1
+          fi
+          echo "::add-mask::$SID"
+          echo "sid=$SID" >> "$GITHUB_OUTPUT"
+
+      - name: Stop AMP server
+        env:
+          AMP_URL: ${{ secrets.AMP_URL }}
+          SID: ${{ steps.amp.outputs.sid }}
+        run: |
+          BODY=$(jq -nc --arg s "$SID" '{SESSIONID:$s}')
+          curl -fsSL -X POST "$AMP_URL/API/Core/Stop" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            --data "$BODY" || true
+          echo "Aguardando 25s pro servidor parar limpinho…"
+          sleep 25
+
+      - name: Mirror mods + config via SFTP
+        env:
+          SFTP_HOST: ${{ secrets.SFTP_HOST }}
+          SFTP_PORT: ${{ secrets.SFTP_PORT }}
+          SFTP_USER: ${{ secrets.SFTP_USER }}
+          SFTP_PASS: ${{ secrets.SFTP_PASS }}
+        run: |
+          # lftp lê SFTP_USER/SFTP_PASS apenas via env interpolation aqui dentro,
+          # nunca passa pra command line (não vaza em ps aux).
+          lftp <<'LFTP_SCRIPT'
+          set sftp:auto-confirm yes
+          set net:max-retries 3
+          set net:reconnect-interval-base 5
+          set net:timeout 30
+          LFTP_SCRIPT
+          lftp -e "
+            set sftp:auto-confirm yes;
+            set net:max-retries 3;
+            open -u \"$SFTP_USER\",\"$SFTP_PASS\" -p $SFTP_PORT sftp://$SFTP_HOST;
+            mirror --reverse --delete --verbose --parallel=4 --exclude-glob .gitkeep mods/ /mods/;
+            mirror --reverse --delete --verbose --parallel=4 --exclude-glob .gitkeep config/ /config/;
+            bye
+          "
+
+      - name: Start AMP server
+        if: always() && steps.amp.outputs.sid != ''
+        env:
+          AMP_URL: ${{ secrets.AMP_URL }}
+          SID: ${{ steps.amp.outputs.sid }}
+        run: |
+          BODY=$(jq -nc --arg s "$SID" '{SESSIONID:$s}')
+          curl -fsSL -X POST "$AMP_URL/API/Core/Start" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            --data "$BODY"
+          echo "Servidor iniciado. Pode demorar uns 30-60s pra carregar todo o modpack."
